@@ -15,7 +15,6 @@ import torch
 
 from tests.v1.kv_connector.unit.offloading_connector.utils import make_kv_cache_group
 from tests.v1.kv_connector.unit.utils import (
-    create_model_runner_output,
     create_request,
     create_scheduler,
     create_vllm_config,
@@ -274,18 +273,12 @@ def test_cpu_offload_wins_when_nixl_has_no_match():
     scheduler.add_request(req1)
     sched_out1 = scheduler.schedule()
 
-    # build_connector_meta runs before _update_after_schedule, so num_computed_tokens
-    # is still 0 during the first schedule and the store sees no confirmed blocks.
-    # Simulate one model step so the second schedule triggers the store.
-    model_output = create_model_runner_output(reqs=[req1])
-    scheduler.update_from_output(sched_out1, model_output)
-
-    sched_out2 = scheduler.schedule()
-    meta2 = sched_out2.kv_connector_metadata
-    assert isinstance(meta2, MultiKVConnectorMetadata)
-    cpu_meta = meta2.metadata[1]
+    # The prompt blocks are stored by the step that computes them.
+    meta1 = sched_out1.kv_connector_metadata
+    assert isinstance(meta1, MultiKVConnectorMetadata)
+    cpu_meta = meta1.metadata[1]
     assert isinstance(cpu_meta, SimpleCPUOffloadMetadata)
-    assert cpu_meta.store_event >= 0, "Expected a store event on the second schedule"
+    assert cpu_meta.store_event >= 0, "Expected a store event on the first schedule"
 
     cpu_connector = mc._connectors[1]
     assert isinstance(cpu_connector, SimpleCPUOffloadConnector)

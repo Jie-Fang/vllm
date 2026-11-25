@@ -370,6 +370,57 @@ def test_lookahead_mamba_partial_tail_survives_finish(
     assert sched.get_num_new_matched_tokens(divergent, 0)[0] < boundary
 
 
+@pytest.mark.cpu_test
+def test_final_prefill_chunk_stored_with_its_forward():
+    """The last prefill chunk's blocks are stored by the step that computes them.
+
+    A finish-time flush is issued only once the scheduler has seen the request
+    finish: under pipeline parallelism, a full pipeline traversal later. A
+    follow-up turn arriving in between misses those blocks on CPU.
+    """
+    config = _make_vllm_config()
+    config.scheduler_config.async_scheduling = False
+    assert config.kv_transfer_config is not None
+    config.kv_transfer_config.kv_connector_extra_config = {"num_cpu_blocks": 32}
+    engine = create_scheduler(
+        config, num_blocks=32, kv_cache_config=_make_kv_cache_config(32)
+    )
+    assert isinstance(engine.connector, SimpleCPUOffloadConnector)
+    sched = engine.connector.scheduler_manager
+    assert sched is not None
+    prompt = list(range(100))
+    block_hasher = get_request_block_hasher(BLOCK_SIZE, sha256)
+    req = Request(
+        "first", prompt, SamplingParams(max_tokens=1), None, block_hasher=block_hasher
+    )
+    engine.add_request(req)
+    # With a 64-token budget, the final chunk computes full blocks 4 and 5.
+    for num_tokens in (64, 36):
+        step = engine.schedule()
+        assert step.num_scheduled_tokens == {req.request_id: num_tokens}
+        is_final = req.num_computed_tokens == req.num_tokens
+        engine.update_from_output(
+            step,
+            ModelRunnerOutput(
+                req_ids=[req.request_id], sampled_token_ids=[[99] if is_final else []]
+            ),
+        )
+        meta = step.kv_connector_metadata
+        assert isinstance(meta, SimpleCPUOffloadMetadata)
+        if meta.store_event >= 0:
+            simulate_store_completion(sched, meta.store_event)
+    assert req.is_finished()
+
+    follow_up = Request(
+        "follow-up",
+        prompt,
+        SamplingParams(max_tokens=1),
+        None,
+        block_hasher=block_hasher,
+    )
+    assert sched.get_num_new_matched_tokens(follow_up, 0) == (6 * BLOCK_SIZE, True)
+
+
 @pytest.mark.parametrize(
     ("backend", "source"),
     [("cpu", CacheHitSource.HOST), ("disk", CacheHitSource.DISK)],
@@ -2681,7 +2732,6 @@ def test_cp_effective_block_size_store_and_load(
     req = _make_cp_request(num_blocks=2, virtual_block_size=vbs)
     gpu_blocks = _allocate_cp_gpu_blocks(gpu_pool, req, 2, vbs)
     kv = KVCacheBlocks(blocks=(gpu_blocks,))
-    req.num_computed_tokens = vbs
     sched.update_state_after_alloc(req, kv, num_external_tokens=0)
     m1 = sched.build_connector_meta(
         make_scheduler_output(
@@ -2944,23 +2994,16 @@ def test_hybrid_store_uses_resolved_group_block_sizes() -> None:
     )
     kv_blocks = KVCacheBlocks(blocks=(attention_blocks, replicated_blocks))
     sched.update_state_after_alloc(req, kv_blocks, num_external_tokens=0)
-    sched.build_connector_meta(
+    meta = sched.build_connector_meta(
         make_scheduler_output(
             {req.request_id: confirmed},
             new_reqs={req.request_id: kv_blocks.get_block_ids()},
         )
     )
-    req.num_computed_tokens = confirmed
-    meta = sched.build_connector_meta(
-        make_scheduler_output(
-            {req.request_id: 1},
-            cached_req_new_blocks={req.request_id: None},
-        )
-    )
 
-    # Both groups are positionally stable here, so every confirmed block of
-    # both must be offloaded. Over-scaling the replicated group halves its
-    # count.
+    # Both groups are positionally stable here, so every block this step
+    # computes in both must be offloaded. Over-scaling the replicated group
+    # halves its count.
     assert sched._reqs_to_store[req.request_id].num_stored_blocks == [
         confirmed // attention_size,
         confirmed // replicated_size,
@@ -3038,23 +3081,12 @@ def test_dcp_mixed_cache_loads_fine_grained_external_hit() -> None:
         },
     )
     store_meta = sched.build_connector_meta(store_output)
-    # The exact handoffs land in the step they arrive; the append-only FA scan
-    # picks its blocks up once the scheduler has committed the tokens.
+    # The exact handoffs and the FA blocks this step computes land together.
     assert set(store_meta.store_gpu_blocks) == {
-        block.block_id for block in mamba_blocks
+        *(block.block_id for block in mamba_blocks),
+        *(block.block_id for block in attention_blocks),
     }
     simulate_store_completion(sched, store_meta.store_event)
-    producer.num_computed_tokens = total_cached_tokens
-    fa_meta = sched.build_connector_meta(
-        make_scheduler_output(
-            {producer.request_id: 1},
-            cached_req_new_blocks={producer.request_id: None},
-        )
-    )
-    assert set(fa_meta.store_gpu_blocks) == {
-        block.block_id for block in attention_blocks
-    }
-    simulate_store_completion(sched, fa_meta.store_event)
 
     consumer = Request(
         request_id="req-dcp-mixed-fine-load",
@@ -3343,15 +3375,16 @@ def test_eager_store_does_not_scan_mamba_blocks_positionally() -> None:
     )
     meta1 = sched.build_connector_meta(output)
     assert meta1.store_event >= 0
-    # Only the exact handoff lands this step. build_connector_meta runs before
-    # the scheduler commits this step's tokens, so the positional scan has
-    # nothing confirmed yet.
-    assert set(meta1.store_gpu_blocks) == {gpu_blocks[1].block_id}
-    assert sched._reqs_to_store[req.request_id].num_stored_blocks == [0, 0]
+    # The attention blocks this step computes are scanned positionally; the
+    # mamba state lands only through its exact handoff.
+    assert set(meta1.store_gpu_blocks) == {
+        gpu_blocks[1].block_id,
+        *(block.block_id for block in attn_blocks),
+    }
+    assert sched._reqs_to_store[req.request_id].num_stored_blocks == [2, 0]
     simulate_store_completion(sched, meta1.store_event)
 
-    # Next step the attention blocks are confirmed and scanned positionally. A
-    # later hash update still must not make the mamba align snapshot a valid
+    # A later hash update still must not make the mamba align snapshot a valid
     # source; the explicit boundary-handoff tests cover the supported path.
     gpu_blocks[0].set_block_hash(make_block_hash_with_group_id(req.block_hashes[0], 1))
     req.num_computed_tokens = 2 * block_size
@@ -3361,19 +3394,8 @@ def test_eager_store_does_not_scan_mamba_blocks_positionally() -> None:
             cached_req_new_blocks={req.request_id: None},
         )
     )
-    assert set(meta2.store_gpu_blocks) == {block.block_id for block in attn_blocks}
-    assert sched._reqs_to_store[req.request_id].num_stored_blocks == [2, 0]
-    simulate_store_completion(sched, meta2.store_event)
-
-    # Nothing further: mamba align is never picked up positionally.
-    meta3 = sched.build_connector_meta(
-        make_scheduler_output(
-            {req.request_id: 1},
-            cached_req_new_blocks={req.request_id: None},
-        )
-    )
-    assert meta3.store_event == -1
-    assert meta3.store_gpu_blocks == []
+    assert meta2.store_event == -1
+    assert meta2.store_gpu_blocks == []
     assert sched._reqs_to_store[req.request_id].num_stored_blocks == [2, 0]
 
 

@@ -685,9 +685,10 @@ class SimpleCPUOffloadScheduler:
     ]:
         """Identify newly computed blocks to offload from scheduler requests.
 
-        Only considers blocks whose KV data has been **confirmed computed** by
-        the GPU. Blocks from the current step are stored on a later step, or by
-        the finish-time flush if the request completes first.
+        Considers blocks computed by earlier steps plus the prompt blocks this
+        step computes. Workers copy stores after the step's forward (see
+        `SimpleCPUOffloadWorker.wait_for_save`), so a final prefill chunk is
+        stored with its forward rather than by the finish-time flush.
 
         Returns:
             (gpu_block_ids, cpu_block_ids, req_ids, block_meta) for the store
@@ -806,7 +807,9 @@ class SimpleCPUOffloadScheduler:
                 continue
 
             gpu_block_ids, advanced_per_group, block_meta = (
-                self._select_eager_blocks_to_store(state, block_ids_by_group)
+                self._select_eager_blocks_to_store(
+                    state, block_ids_by_group, num_scheduled_tokens=num_new_tokens
+                )
             )
 
             # Batch allocate the CPU destinations.
@@ -863,12 +866,24 @@ class SimpleCPUOffloadScheduler:
         self,
         state: StoreRequestState,
         block_ids_by_group: tuple[list[int], ...],
+        num_scheduled_tokens: int = 0,
     ) -> tuple[
         list[int],
         list[int],
         list[dict[BlockHashWithGroupId, BlockStoreMeta]] | None,
     ]:
-        """Return confirmed eager blocks, cursor advances, and event metadata."""
+        """Return storable eager blocks, cursor advances, and event metadata.
+
+        Args:
+            state: The request's store state.
+            block_ids_by_group: The request's GPU block IDs per group.
+            num_scheduled_tokens: The request's tokens in the step being
+                built, not yet counted in `num_computed_tokens`. The prompt
+                blocks they complete are included: `allocate_slots` already
+                hashed them, and the worker copies them after this step's
+                forward. Blocks that need sampled tokens wait for a later step.
+
+        """
         assert self._gpu_block_pool is not None
         gpu_block_ids: list[int] = []
         advanced_per_group = [0] * len(self.cpu_kv_cache_config.kv_cache_groups)
@@ -876,10 +891,18 @@ class SimpleCPUOffloadScheduler:
             [] if self.enable_kv_cache_events else None
         )
         request = state.request
-        confirmed_tokens = request.num_computed_tokens - request.num_output_placeholders
+        storable_tokens = request.num_computed_tokens - request.num_output_placeholders
+        if num_scheduled_tokens:
+            storable_tokens = max(
+                storable_tokens,
+                min(
+                    request.num_computed_tokens + num_scheduled_tokens,
+                    request.num_prompt_tokens,
+                ),
+            )
         # Mimic the GPU KV cache manager's cacheable prefix.
         cacheable_tokens = min(
-            self.cpu_coordinator.get_num_cacheable_tokens(confirmed_tokens),
+            self.cpu_coordinator.get_num_cacheable_tokens(storable_tokens),
             len(request.block_hashes) * self.hash_block_size,
         )
         num_free = self.cpu_block_pool.get_num_free_blocks()
